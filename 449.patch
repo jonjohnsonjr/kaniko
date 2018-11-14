@@ -1,0 +1,876 @@
+From 6c1b262b6b04fd6b53a88ec9536222ab10f11ee9 Mon Sep 17 00:00:00 2001
+From: dlorenc <lorenc.d@gmail.com>
+Date: Tue, 13 Nov 2018 13:29:08 -0800
+Subject: [PATCH] WIP: switch to stream.newLayer
+
+---
+ Gopkg.lock                                    |   8 +-
+ Gopkg.toml                                    |   2 +-
+ pkg/executor/build.go                         |   5 +-
+ pkg/executor/push.go                          |   6 +-
+ .../pkg/v1/mutate/mutate.go                   | 203 +++++++++++-------
+ .../pkg/v1/random/image.go                    |   5 +-
+ .../pkg/v1/remote/write.go                    | 147 +++++++------
+ .../pkg/v1/stream/layer.go                    | 176 +++++++++++++++
+ 8 files changed, 408 insertions(+), 144 deletions(-)
+ create mode 100644 vendor/github.com/google/go-containerregistry/pkg/v1/stream/layer.go
+
+diff --git a/Gopkg.lock b/Gopkg.lock
+index b11e5ee7..a8a0aa4e 100644
+--- a/Gopkg.lock
++++ b/Gopkg.lock
+@@ -430,7 +430,7 @@
+   version = "v0.2.0"
+ 
+ [[projects]]
+-  digest = "1:f1b23f53418c1b035a5965ac2600a28b16c08643683d5213fb581ecf4e79a02a"
++  digest = "1:28350f45b2c6b5a44616efcdce96bf8392509b53853fbf8f6fef07a1cb670e18"
+   name = "github.com/google/go-containerregistry"
+   packages = [
+     "pkg/authn",
+@@ -444,12 +444,13 @@
+     "pkg/v1/random",
+     "pkg/v1/remote",
+     "pkg/v1/remote/transport",
++    "pkg/v1/stream",
+     "pkg/v1/tarball",
+     "pkg/v1/types",
+     "pkg/v1/v1util",
+   ]
+   pruneopts = "NUT"
+-  revision = "88d8d18eb1bde1fcef23c745205c738074290515"
++  revision = "c0dc13359f0157195b20e7b2af90ca7cad2db828"
+ 
+ [[projects]]
+   digest = "1:f4f203acd8b11b8747bdcd91696a01dbc95ccb9e2ca2db6abf81c3a4f5e950ce"
+@@ -1174,7 +1175,9 @@
+     "github.com/aws/aws-sdk-go/service/s3",
+     "github.com/aws/aws-sdk-go/service/s3/s3manager",
+     "github.com/docker/docker/builder/dockerfile",
++    "github.com/docker/docker/builder/dockerignore",
+     "github.com/docker/docker/pkg/archive",
++    "github.com/docker/docker/pkg/fileutils",
+     "github.com/docker/docker/pkg/signal",
+     "github.com/genuinetools/amicontained/container",
+     "github.com/google/go-cmp/cmp",
+@@ -1197,6 +1200,7 @@
+     "github.com/spf13/cobra",
+     "golang.org/x/net/context",
+     "golang.org/x/oauth2",
++    "golang.org/x/sync/errgroup",
+     "k8s.io/client-go/discovery",
+   ]
+   solver-name = "gps-cdcl"
+diff --git a/Gopkg.toml b/Gopkg.toml
+index 9431660c..e92a14cc 100644
+--- a/Gopkg.toml
++++ b/Gopkg.toml
+@@ -37,7 +37,7 @@ required = [
+ 
+ [[constraint]]
+   name = "github.com/google/go-containerregistry"
+-  revision = "88d8d18eb1bde1fcef23c745205c738074290515"
++  revision = "c0dc13359f0157195b20e7b2af90ca7cad2db828"
+ 
+ [[override]]
+   name = "k8s.io/apimachinery"
+diff --git a/pkg/executor/build.go b/pkg/executor/build.go
+index e11c0fd5..5d796e67 100644
+--- a/pkg/executor/build.go
++++ b/pkg/executor/build.go
+@@ -23,6 +23,8 @@ import (
+ 	"strconv"
+ 	"time"
+ 
++	"github.com/google/go-containerregistry/pkg/v1/stream"
++
+ 	"golang.org/x/sync/errgroup"
+ 
+ 	"github.com/google/go-containerregistry/pkg/name"
+@@ -296,10 +298,11 @@ func (s *stageBuilder) saveSnapshotToImage(createdBy string, tarPath string) err
+ 		return nil
+ 	}
+ 
+-	layer, err := tarball.LayerFromFile(tarPath)
++	f, err := os.Open(tarPath)
+ 	if err != nil {
+ 		return err
+ 	}
++	layer := stream.NewLayer(f)
+ 	s.image, err = mutate.Append(s.image,
+ 		mutate.Addendum{
+ 			Layer: layer,
+diff --git a/pkg/executor/push.go b/pkg/executor/push.go
+index c2fe76d4..970d1993 100644
+--- a/pkg/executor/push.go
++++ b/pkg/executor/push.go
+@@ -20,6 +20,7 @@ import (
+ 	"crypto/tls"
+ 	"fmt"
+ 	"net/http"
++	"os"
+ 
+ 	"github.com/GoogleContainerTools/kaniko/pkg/cache"
+ 	"github.com/GoogleContainerTools/kaniko/pkg/config"
+@@ -32,6 +33,7 @@ import (
+ 	"github.com/google/go-containerregistry/pkg/v1/empty"
+ 	"github.com/google/go-containerregistry/pkg/v1/mutate"
+ 	"github.com/google/go-containerregistry/pkg/v1/remote"
++	"github.com/google/go-containerregistry/pkg/v1/stream"
+ 	"github.com/google/go-containerregistry/pkg/v1/tarball"
+ 	"github.com/pkg/errors"
+ 	"github.com/sirupsen/logrus"
+@@ -108,10 +110,12 @@ func DoPush(image v1.Image, opts *config.KanikoOptions) error {
+ // pushLayerToCache pushes layer (tagged with cacheKey) to opts.Cache
+ // if opts.Cache doesn't exist, infer the cache from the given destination
+ func pushLayerToCache(opts *config.KanikoOptions, cacheKey string, tarPath string, createdBy string) error {
+-	layer, err := tarball.LayerFromFile(tarPath)
++	f, err := os.Open(tarPath)
+ 	if err != nil {
+ 		return err
+ 	}
++	layer := stream.NewLayer(f)
++
+ 	cache, err := cache.Destination(opts, cacheKey)
+ 	if err != nil {
+ 		return errors.Wrap(err, "getting cache destination")
+diff --git a/vendor/github.com/google/go-containerregistry/pkg/v1/mutate/mutate.go b/vendor/github.com/google/go-containerregistry/pkg/v1/mutate/mutate.go
+index b24d6896..5fc792d0 100644
+--- a/vendor/github.com/google/go-containerregistry/pkg/v1/mutate/mutate.go
++++ b/vendor/github.com/google/go-containerregistry/pkg/v1/mutate/mutate.go
+@@ -29,6 +29,7 @@ import (
+ 	"github.com/google/go-containerregistry/pkg/v1"
+ 	"github.com/google/go-containerregistry/pkg/v1/empty"
+ 	"github.com/google/go-containerregistry/pkg/v1/partial"
++	"github.com/google/go-containerregistry/pkg/v1/stream"
+ 	"github.com/google/go-containerregistry/pkg/v1/tarball"
+ 	"github.com/google/go-containerregistry/pkg/v1/types"
+ 	"github.com/google/go-containerregistry/pkg/v1/v1util"
+@@ -58,77 +59,14 @@ func Append(base v1.Image, adds ...Addendum) (v1.Image, error) {
+ 	if len(adds) == 0 {
+ 		return base, nil
+ 	}
+-
+ 	if err := validate(adds); err != nil {
+ 		return nil, err
+ 	}
+ 
+-	m, err := base.Manifest()
+-	if err != nil {
+-		return nil, err
+-	}
+-
+-	cf, err := base.ConfigFile()
+-	if err != nil {
+-		return nil, err
+-	}
+-
+-	image := &image{
+-		Image:      base,
+-		manifest:   m.DeepCopy(),
+-		configFile: cf.DeepCopy(),
+-		diffIDMap:  make(map[v1.Hash]v1.Layer),
+-		digestMap:  make(map[v1.Hash]v1.Layer),
+-	}
+-
+-	diffIDs := image.configFile.RootFS.DiffIDs
+-	history := image.configFile.History
+-
+-	for _, add := range adds {
+-		diffID, err := add.Layer.DiffID()
+-		if err != nil {
+-			return nil, err
+-		}
+-		diffIDs = append(diffIDs, diffID)
+-		history = append(history, add.History)
+-		image.diffIDMap[diffID] = add.Layer
+-	}
+-
+-	manifestLayers := image.manifest.Layers
+-
+-	for _, add := range adds {
+-		d := v1.Descriptor{
+-			MediaType: types.DockerLayer,
+-		}
+-
+-		if d.Size, err = add.Layer.Size(); err != nil {
+-			return nil, err
+-		}
+-
+-		if d.Digest, err = add.Layer.Digest(); err != nil {
+-			return nil, err
+-		}
+-
+-		manifestLayers = append(manifestLayers, d)
+-		image.digestMap[d.Digest] = add.Layer
+-	}
+-
+-	image.configFile.RootFS.DiffIDs = diffIDs
+-	image.configFile.History = history
+-	image.manifest.Layers = manifestLayers
+-
+-	rcfg, err := image.RawConfigFile()
+-	if err != nil {
+-		return nil, err
+-	}
+-	d, sz, err := v1.SHA256(bytes.NewBuffer(rcfg))
+-	if err != nil {
+-		return nil, err
+-	}
+-	image.manifest.Config.Digest = d
+-	image.manifest.Config.Size = sz
+-
+-	return image, nil
++	return &image{
++		base: base,
++		adds: adds,
++	}, nil
+ }
+ 
+ // Config mutates the provided v1.Image to have the provided v1.Config
+@@ -150,10 +88,8 @@ func configFile(base v1.Image, cfg *v1.ConfigFile) (v1.Image, error) {
+ 	}
+ 
+ 	image := &image{
+-		Image:      base,
+-		manifest:   m.DeepCopy(),
+-		configFile: cfg,
+-		digestMap:  make(map[v1.Hash]v1.Layer),
++		base:     base,
++		manifest: m.DeepCopy(),
+ 	}
+ 
+ 	rcfg, err := image.RawConfigFile()
+@@ -166,6 +102,7 @@ func configFile(base v1.Image, cfg *v1.ConfigFile) (v1.Image, error) {
+ 	}
+ 	image.manifest.Config.Digest = d
+ 	image.manifest.Config.Size = sz
++	image.configFile = cfg
+ 	return image, nil
+ }
+ 
+@@ -183,16 +120,113 @@ func CreatedAt(base v1.Image, created v1.Time) (v1.Image, error) {
+ }
+ 
+ type image struct {
+-	v1.Image
++	base v1.Image
++	adds []Addendum
++
++	computed   bool
+ 	configFile *v1.ConfigFile
+ 	manifest   *v1.Manifest
+ 	diffIDMap  map[v1.Hash]v1.Layer
+ 	digestMap  map[v1.Hash]v1.Layer
+ }
+ 
++var _ v1.Image = (*image)(nil)
++
++func (i *image) MediaType() (types.MediaType, error) { return i.base.MediaType() }
++
++func (i *image) compute() error {
++	// Don't re-compute if already computed.
++	if i.computed {
++		return nil
++	}
++	cf, err := i.base.ConfigFile()
++	if err != nil {
++		return err
++	}
++	configFile := cf.DeepCopy()
++	diffIDs := configFile.RootFS.DiffIDs
++	history := configFile.History
++
++	diffIDMap := make(map[v1.Hash]v1.Layer)
++	digestMap := make(map[v1.Hash]v1.Layer)
++
++	for _, add := range i.adds {
++		diffID, err := add.Layer.DiffID()
++		if err != nil {
++			return err
++		}
++		diffIDs = append(diffIDs, diffID)
++		history = append(history, add.History)
++		diffIDMap[diffID] = add.Layer
++	}
++
++	m, err := i.base.Manifest()
++	if err != nil {
++		return err
++	}
++	manifest := m.DeepCopy()
++	manifestLayers := manifest.Layers
++	for _, add := range i.adds {
++		d := v1.Descriptor{
++			MediaType: types.DockerLayer,
++		}
++
++		var err error
++		if d.Size, err = add.Layer.Size(); err != nil {
++			return err
++		}
++
++		if d.Digest, err = add.Layer.Digest(); err != nil {
++			return err
++		}
++
++		manifestLayers = append(manifestLayers, d)
++		digestMap[d.Digest] = add.Layer
++	}
++
++	configFile.RootFS.DiffIDs = diffIDs
++	configFile.History = history
++
++	manifest.Layers = manifestLayers
++
++	rcfg, err := json.Marshal(configFile)
++	if err != nil {
++		return err
++	}
++	d, sz, err := v1.SHA256(bytes.NewBuffer(rcfg))
++	if err != nil {
++		return err
++	}
++	manifest.Config.Digest = d
++	manifest.Config.Size = sz
++
++	i.configFile = configFile
++	i.manifest = manifest
++	i.diffIDMap = diffIDMap
++	i.digestMap = digestMap
++	i.computed = true
++	return nil
++}
++
+ // Layers returns the ordered collection of filesystem layers that comprise this image.
+ // The order of the list is oldest/base layer first, and most-recent/top layer last.
+ func (i *image) Layers() ([]v1.Layer, error) {
++	if err := i.compute(); err == stream.ErrNotComputed {
++		// Image contains a streamable layer which has not yet been
++		// consumed. Just return the layers we have in case the caller
++		// is going to consume the layers.
++		layers, err := i.base.Layers()
++		if err != nil {
++			return nil, err
++		}
++		for _, add := range i.adds {
++			layers = append(layers, add.Layer)
++		}
++		return layers, nil
++	} else if err != nil {
++		return nil, err
++	}
++
+ 	diffIDs, err := partial.DiffIDs(i)
+ 	if err != nil {
+ 		return nil, err
+@@ -210,36 +244,57 @@ func (i *image) Layers() ([]v1.Layer, error) {
+ 
+ // BlobSet returns an unordered collection of all the blobs in the image.
+ func (i *image) BlobSet() (map[v1.Hash]struct{}, error) {
++	if err := i.compute(); err != nil {
++		return nil, err
++	}
+ 	return partial.BlobSet(i)
+ }
+ 
+ // ConfigName returns the hash of the image's config file.
+ func (i *image) ConfigName() (v1.Hash, error) {
++	if err := i.compute(); err != nil {
++		return v1.Hash{}, err
++	}
+ 	return partial.ConfigName(i)
+ }
+ 
+ // ConfigFile returns this image's config file.
+ func (i *image) ConfigFile() (*v1.ConfigFile, error) {
++	if err := i.compute(); err != nil {
++		return nil, err
++	}
+ 	return i.configFile, nil
+ }
+ 
+ // RawConfigFile returns the serialized bytes of ConfigFile()
+ func (i *image) RawConfigFile() ([]byte, error) {
++	if err := i.compute(); err != nil {
++		return nil, err
++	}
+ 	return json.Marshal(i.configFile)
+ }
+ 
+ // Digest returns the sha256 of this image's manifest.
+ func (i *image) Digest() (v1.Hash, error) {
++	if err := i.compute(); err != nil {
++		return v1.Hash{}, err
++	}
+ 	return partial.Digest(i)
+ }
+ 
+ // Manifest returns this image's Manifest object.
+ func (i *image) Manifest() (*v1.Manifest, error) {
++	if err := i.compute(); err != nil {
++		return nil, err
++	}
+ 	return i.manifest, nil
+ }
+ 
+ // RawManifest returns the serialized bytes of Manifest()
+ func (i *image) RawManifest() ([]byte, error) {
++	if err := i.compute(); err != nil {
++		return nil, err
++	}
+ 	return json.Marshal(i.manifest)
+ }
+ 
+@@ -254,7 +309,7 @@ func (i *image) LayerByDigest(h v1.Hash) (v1.Layer, error) {
+ 	if layer, ok := i.digestMap[h]; ok {
+ 		return layer, nil
+ 	}
+-	return i.Image.LayerByDigest(h)
++	return i.base.LayerByDigest(h)
+ }
+ 
+ // LayerByDiffID is an analog to LayerByDigest, looking up by "diff id"
+@@ -263,7 +318,7 @@ func (i *image) LayerByDiffID(h v1.Hash) (v1.Layer, error) {
+ 	if layer, ok := i.diffIDMap[h]; ok {
+ 		return layer, nil
+ 	}
+-	return i.Image.LayerByDiffID(h)
++	return i.base.LayerByDiffID(h)
+ }
+ 
+ func validate(adds []Addendum) error {
+diff --git a/vendor/github.com/google/go-containerregistry/pkg/v1/random/image.go b/vendor/github.com/google/go-containerregistry/pkg/v1/random/image.go
+index 2f9930fb..698b5558 100644
+--- a/vendor/github.com/google/go-containerregistry/pkg/v1/random/image.go
++++ b/vendor/github.com/google/go-containerregistry/pkg/v1/random/image.go
+@@ -54,8 +54,9 @@ func Image(byteSize, layers int64) (v1.Image, error) {
+ 		var b bytes.Buffer
+ 		tw := tar.NewWriter(&b)
+ 		if err := tw.WriteHeader(&tar.Header{
+-			Name: fmt.Sprintf("random_file_%d.txt", i),
+-			Size: byteSize,
++			Name:     fmt.Sprintf("random_file_%d.txt", i),
++			Size:     byteSize,
++			Typeflag: tar.TypeRegA,
+ 		}); err != nil {
+ 			return nil, err
+ 		}
+diff --git a/vendor/github.com/google/go-containerregistry/pkg/v1/remote/write.go b/vendor/github.com/google/go-containerregistry/pkg/v1/remote/write.go
+index 1fd633c0..839d2b3b 100644
+--- a/vendor/github.com/google/go-containerregistry/pkg/v1/remote/write.go
++++ b/vendor/github.com/google/go-containerregistry/pkg/v1/remote/write.go
+@@ -18,6 +18,7 @@ import (
+ 	"bytes"
+ 	"errors"
+ 	"fmt"
++	"io"
+ 	"log"
+ 	"net/http"
+ 	"net/url"
+@@ -25,7 +26,10 @@ import (
+ 	"github.com/google/go-containerregistry/pkg/authn"
+ 	"github.com/google/go-containerregistry/pkg/name"
+ 	"github.com/google/go-containerregistry/pkg/v1"
++	"github.com/google/go-containerregistry/pkg/v1/partial"
+ 	"github.com/google/go-containerregistry/pkg/v1/remote/transport"
++	"github.com/google/go-containerregistry/pkg/v1/stream"
++	"golang.org/x/sync/errgroup"
+ )
+ 
+ // Write pushes the provided img to the specified image reference.
+@@ -41,36 +45,31 @@ func Write(ref name.Reference, img v1.Image, auth authn.Authenticator, t http.Ro
+ 		return err
+ 	}
+ 	w := writer{
+-		ref:     ref,
+-		client:  &http.Client{Transport: tr},
+-		img:     img,
++		ref:    ref,
++		client: &http.Client{Transport: tr},
++		img:    img,
+ 	}
+ 
+-	bs, err := img.BlobSet()
+-	if err != nil {
+-		return err
++	// Upload individual layers in goroutines and collect any errors.
++	var g errgroup.Group
++	for _, l := range ls {
++		l := l
++		g.Go(func() error {
++			return w.uploadOne(l)
++		})
+ 	}
+-
+-	// Spin up go routines to publish each of the members of BlobSet(),
+-	// and use an error channel to collect their results.
+-	errCh := make(chan error)
+-	defer close(errCh)
+-	for h := range bs {
+-		go func(h v1.Hash) {
+-			errCh <- w.uploadOne(h)
+-		}(h)
++	if err := g.Wait(); err != nil {
++		return err
+ 	}
+ 
+-	// Now wait for all of the blob uploads to complete.
+-	var errors []error
+-	for _ = range bs {
+-		if err := <-errCh; err != nil {
+-			errors = append(errors, err)
+-		}
++	// Now that all the layers are uploaded, upload the config file blob.
++	// This must be done last because some layers may have been streamed.
++	l, err := partial.ConfigLayer(img)
++	if err != nil {
++		return err
+ 	}
+-	if len(errors) > 0 {
+-		// Return the first error we encountered.
+-		return errors[0]
++	if err := w.uploadOne(l); err != nil {
++		return err
+ 	}
+ 
+ 	// With all of the constituent elements uploaded, upload the manifest
+@@ -80,9 +79,9 @@ func Write(ref name.Reference, img v1.Image, auth authn.Authenticator, t http.Ro
+ 
+ // writer writes the elements of an image to a remote image reference.
+ type writer struct {
+-	ref     name.Reference
+-	client  *http.Client
+-	img     v1.Image
++	ref    name.Reference
++	client *http.Client
++	img    v1.Image
+ }
+ 
+ // url returns a url.Url for the specified path in the context of this remote image reference.
+@@ -136,20 +135,14 @@ func (w *writer) checkExisting(h v1.Hash) (bool, error) {
+ // On success, the layer was either mounted (nothing more to do) or a blob
+ // upload was initiated and the body of that blob should be sent to the returned
+ // location.
+-func (w *writer) initiateUpload(h v1.Hash) (location string, mounted bool, err error) {
++func (w *writer) initiateUpload(from, mount string) (location string, mounted bool, err error) {
+ 	u := w.url(fmt.Sprintf("/v2/%s/blobs/uploads/", w.ref.Context().RepositoryStr()))
+-	uv := url.Values{
+-		"mount": []string{h.String()},
++	uv := url.Values{}
++	if mount != "" {
++		uv["mount"] = []string{mount}
+ 	}
+-	l, err := w.img.LayerByDigest(h)
+-	if err != nil {
+-		return "", false, err
+-	}
+-
+-	if ml, ok := l.(*MountableLayer); ok {
+-		if w.ref.Context().RegistryStr() == ml.Reference.Context().RegistryStr() {
+-			uv["from"] = []string{ml.Reference.Context().RepositoryStr()}
+-		}
++	if from != "" {
++		uv["from"] = []string{from}
+ 	}
+ 	u.RawQuery = uv.Encode()
+ 
+@@ -181,15 +174,7 @@ func (w *writer) initiateUpload(h v1.Hash) (location string, mounted bool, err e
+ // streamBlob streams the contents of the blob to the specified location.
+ // On failure, this will return an error.  On success, this will return the location
+ // header indicating how to commit the streamed blob.
+-func (w *writer) streamBlob(h v1.Hash, streamLocation string) (commitLocation string, err error) {
+-	l, err := w.img.LayerByDigest(h)
+-	if err != nil {
+-		return "", err
+-	}
+-	blob, err := l.Compressed()
+-	if err != nil {
+-		return "", err
+-	}
++func (w *writer) streamBlob(blob io.ReadCloser, streamLocation string) (commitLocation string, err error) {
+ 	defer blob.Close()
+ 
+ 	req, err := http.NewRequest(http.MethodPatch, streamLocation, blob)
+@@ -212,14 +197,15 @@ func (w *writer) streamBlob(h v1.Hash, streamLocation string) (commitLocation st
+ 	return w.nextLocation(resp)
+ }
+ 
+-// commitBlob commits this blob by sending a PUT to the location returned from streaming the blob.
+-func (w *writer) commitBlob(h v1.Hash, location string) (err error) {
++// commitBlob commits this blob by sending a PUT to the location returned from
++// streaming the blob.
++func (w *writer) commitBlob(location, digest string) error {
+ 	u, err := url.Parse(location)
+ 	if err != nil {
+ 		return err
+ 	}
+ 	v := u.Query()
+-	v.Set("digest", h.String())
++	v.Set("digest", digest)
+ 	u.RawQuery = v.Encode()
+ 
+ 	req, err := http.NewRequest(http.MethodPut, u.String(), nil)
+@@ -237,33 +223,68 @@ func (w *writer) commitBlob(h v1.Hash, location string) (err error) {
+ }
+ 
+ // uploadOne performs a complete upload of a single layer.
+-func (w *writer) uploadOne(h v1.Hash) error {
+-	existing, err := w.checkExisting(h)
+-	if err != nil {
+-		return err
++func (w *writer) uploadOne(l v1.Layer) error {
++	var from, mount, digest string
++	if _, ok := l.(*stream.Layer); !ok {
++		// Layer isn't streamable, we should take advantage of that to
++		// skip uploading if possible.
++		// By sending ?digest= in the request, we'll also check that
++		// our computed digest matches the one computed by the
++		// registry.
++		h, err := l.Digest()
++		if err != nil {
++			return err
++		}
++		digest = h.String()
++
++		existing, err := w.checkExisting(h)
++		if err != nil {
++			return err
++		}
++		if existing {
++			log.Printf("existing blob: %v", h)
++			return nil
++		}
++
++		mount = h.String()
+ 	}
+-	if existing {
+-		log.Printf("existing blob: %v", h)
+-		return nil
++	if ml, ok := l.(*MountableLayer); ok {
++		if w.ref.Context().RegistryStr() == ml.Reference.Context().RegistryStr() {
++			from = ml.Reference.Context().RepositoryStr()
++		}
+ 	}
+ 
+-	location, mounted, err := w.initiateUpload(h)
++	location, mounted, err := w.initiateUpload(from, mount)
+ 	if err != nil {
+ 		return err
+ 	} else if mounted {
+-		log.Printf("mounted blob: %v", h)
++		h, err := l.Digest()
++		if err != nil {
++			return err
++		}
++		log.Printf("mounted blob: %s", h.String())
+ 		return nil
+ 	}
+ 
+-	location, err = w.streamBlob(h, location)
++	blob, err := l.Compressed()
++	if err != nil {
++		return err
++	}
++	location, err = w.streamBlob(blob, location)
++	if err != nil {
++		return err
++	}
++
++	h, err := l.Digest()
+ 	if err != nil {
+ 		return err
+ 	}
++	digest = h.String()
+ 
+-	if err := w.commitBlob(h, location); err != nil {
++	if err := w.commitBlob(location, digest); err != nil {
+ 		return err
+ 	}
+-	log.Printf("pushed blob %v", h)
++	log.Printf("pushed blob: %s", digest)
+ 	return nil
+ }
+ 
+diff --git a/vendor/github.com/google/go-containerregistry/pkg/v1/stream/layer.go b/vendor/github.com/google/go-containerregistry/pkg/v1/stream/layer.go
+new file mode 100644
+index 00000000..d1ec96b1
+--- /dev/null
++++ b/vendor/github.com/google/go-containerregistry/pkg/v1/stream/layer.go
+@@ -0,0 +1,176 @@
++// Copyright 2018 Google LLC All Rights Reserved.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//    http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package stream
++
++import (
++	"compress/gzip"
++	"crypto/sha256"
++	"encoding/hex"
++	"errors"
++	"hash"
++	"io"
++
++	"github.com/google/go-containerregistry/pkg/v1"
++)
++
++var (
++	// ErrNotComputed is returned when the requested value is not yet
++	// computed because the stream has not been consumed yet.
++	ErrNotComputed = errors.New("value not computed until stream is consumed")
++
++	// ErrConsumed is returned by Compressed when the underlying stream has
++	// already been consumed and closed.
++	ErrConsumed = errors.New("stream was already consumed")
++)
++
++type Layer struct {
++	blob     io.ReadCloser
++	consumed bool
++
++	digest, diffID *v1.Hash
++	size           int64
++}
++
++var _ v1.Layer = (*Layer)(nil)
++
++func NewLayer(rc io.ReadCloser) *Layer { return &Layer{blob: rc} }
++
++func (l *Layer) Digest() (v1.Hash, error) {
++	if l.digest == nil {
++		return v1.Hash{}, ErrNotComputed
++	}
++	return *l.digest, nil
++}
++
++func (l *Layer) DiffID() (v1.Hash, error) {
++	if l.diffID == nil {
++		return v1.Hash{}, ErrNotComputed
++	}
++	return *l.diffID, nil
++}
++
++func (l *Layer) Size() (int64, error) {
++	if l.size == 0 {
++		return 0, ErrNotComputed
++	}
++	return l.size, nil
++}
++
++func (l *Layer) Uncompressed() (io.ReadCloser, error) {
++	return nil, errors.New("NYI: stream.Layer.Uncompressed is not implemented")
++}
++
++func (l *Layer) Compressed() (io.ReadCloser, error) {
++	if l.consumed {
++		return nil, ErrConsumed
++	}
++	return newCompressedReader(l)
++}
++
++type compressedReader struct {
++	closer io.Closer // original blob's Closer.
++
++	h, zh hash.Hash // collects digests of compressed and uncompressed stream.
++	pr    io.Reader
++	count *countWriter
++
++	l *Layer // stream.Layer to update upon Close.
++}
++
++func newCompressedReader(l *Layer) (*compressedReader, error) {
++	h := sha256.New()
++	zh := sha256.New()
++	count := &countWriter{}
++
++	// gzip.Writer writes to the output stream via pipe, a hasher to
++	// capture compressed digest, and a countWriter to capture compressed
++	// size.
++	pr, pw := io.Pipe()
++	zw, err := gzip.NewWriterLevel(io.MultiWriter(pw, zh, count), gzip.BestSpeed)
++	if err != nil {
++		return nil, err
++	}
++
++	cr := &compressedReader{
++		closer: newMultiCloser(zw, l.blob),
++		pr:     pr,
++		h:      h,
++		zh:     zh,
++		count:  count,
++		l:      l,
++	}
++	go func() {
++		if _, err := io.Copy(io.MultiWriter(h, zw), l.blob); err != nil {
++			pw.CloseWithError(err)
++			return
++		}
++		// Now close the compressed reader, to flush the gzip stream
++		// and calculate digest/diffID/size. This will cause pr to
++		// return EOF which will cause readers of the Compressed stream
++		// to finish reading.
++		pw.CloseWithError(cr.Close())
++	}()
++
++	return cr, nil
++}
++
++func (cr *compressedReader) Read(b []byte) (int, error) { return cr.pr.Read(b) }
++
++func (cr *compressedReader) Close() error {
++	// Close the inner ReadCloser.
++	if err := cr.closer.Close(); err != nil {
++		return err
++	}
++
++	diffID, err := v1.NewHash("sha256:" + hex.EncodeToString(cr.h.Sum(nil)))
++	if err != nil {
++		return err
++	}
++	cr.l.diffID = &diffID
++
++	digest, err := v1.NewHash("sha256:" + hex.EncodeToString(cr.zh.Sum(nil)))
++	if err != nil {
++		return err
++	}
++	cr.l.digest = &digest
++
++	cr.l.size = cr.count.n
++	cr.l.consumed = true
++	return nil
++}
++
++// countWriter counts bytes written to it.
++type countWriter struct{ n int64 }
++
++func (c *countWriter) Write(p []byte) (int, error) {
++	c.n += int64(len(p))
++	return len(p), nil
++}
++
++// multiCloser is a Closer that collects multiple Closers and Closes them in order.
++type multiCloser []io.Closer
++
++var _ io.Closer = (multiCloser)(nil)
++
++func newMultiCloser(c ...io.Closer) multiCloser { return multiCloser(c) }
++
++func (m multiCloser) Close() error {
++	for _, c := range m {
++		if err := c.Close(); err != nil {
++			return err
++		}
++	}
++	return nil
++}

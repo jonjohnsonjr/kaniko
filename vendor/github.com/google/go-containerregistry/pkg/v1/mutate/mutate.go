@@ -21,7 +21,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"path/filepath"
 	"strings"
 	"time"
@@ -29,9 +28,8 @@ import (
 	"github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/empty"
 	"github.com/google/go-containerregistry/pkg/v1/partial"
-	"github.com/google/go-containerregistry/pkg/v1/tarball"
+	"github.com/google/go-containerregistry/pkg/v1/stream"
 	"github.com/google/go-containerregistry/pkg/v1/types"
-	"github.com/google/go-containerregistry/pkg/v1/v1util"
 )
 
 const whiteoutPrefix = ".wh."
@@ -42,6 +40,8 @@ type Addendum struct {
 	Layer   v1.Layer
 	History v1.History
 }
+
+type ConfigMutation func(v1.ConfigFile) (*v1.ConfigFile, error)
 
 // AppendLayers applies layers to a base image
 func AppendLayers(base v1.Image, layers ...v1.Layer) (v1.Image, error) {
@@ -58,89 +58,26 @@ func Append(base v1.Image, adds ...Addendum) (v1.Image, error) {
 	if len(adds) == 0 {
 		return base, nil
 	}
-
 	if err := validate(adds); err != nil {
 		return nil, err
 	}
 
-	m, err := base.Manifest()
-	if err != nil {
-		return nil, err
-	}
-
-	cf, err := base.ConfigFile()
-	if err != nil {
-		return nil, err
-	}
-
-	image := &image{
-		Image:      base,
-		manifest:   m.DeepCopy(),
-		configFile: cf.DeepCopy(),
-		diffIDMap:  make(map[v1.Hash]v1.Layer),
-		digestMap:  make(map[v1.Hash]v1.Layer),
-	}
-
-	diffIDs := image.configFile.RootFS.DiffIDs
-	history := image.configFile.History
-
-	for _, add := range adds {
-		diffID, err := add.Layer.DiffID()
-		if err != nil {
-			return nil, err
-		}
-		diffIDs = append(diffIDs, diffID)
-		history = append(history, add.History)
-		image.diffIDMap[diffID] = add.Layer
-	}
-
-	manifestLayers := image.manifest.Layers
-
-	for _, add := range adds {
-		d := v1.Descriptor{
-			MediaType: types.DockerLayer,
-		}
-
-		if d.Size, err = add.Layer.Size(); err != nil {
-			return nil, err
-		}
-
-		if d.Digest, err = add.Layer.Digest(); err != nil {
-			return nil, err
-		}
-
-		manifestLayers = append(manifestLayers, d)
-		image.digestMap[d.Digest] = add.Layer
-	}
-
-	image.configFile.RootFS.DiffIDs = diffIDs
-	image.configFile.History = history
-	image.manifest.Layers = manifestLayers
-
-	rcfg, err := image.RawConfigFile()
-	if err != nil {
-		return nil, err
-	}
-	d, sz, err := v1.SHA256(bytes.NewBuffer(rcfg))
-	if err != nil {
-		return nil, err
-	}
-	image.manifest.Config.Digest = d
-	image.manifest.Config.Size = sz
-
-	return image, nil
+	return &image{
+		base: base,
+		adds: adds,
+	}, nil
 }
 
 // Config mutates the provided v1.Image to have the provided v1.Config
 func Config(base v1.Image, cfg v1.Config) (v1.Image, error) {
-	cf, err := base.ConfigFile()
-	if err != nil {
-		return nil, err
+	setConfig := func(cf v1.ConfigFile) (*v1.ConfigFile, error) {
+		cf.Config = cfg
+		return &cf, nil
 	}
-
-	cf.Config = cfg
-
-	return configFile(base, cf)
+	return &image{
+		base: base,
+		muts: []ConfigMutation{setConfig},
+	}, nil
 }
 
 func configFile(base v1.Image, cfg *v1.ConfigFile) (v1.Image, error) {
@@ -150,10 +87,8 @@ func configFile(base v1.Image, cfg *v1.ConfigFile) (v1.Image, error) {
 	}
 
 	image := &image{
-		Image:      base,
-		manifest:   m.DeepCopy(),
-		configFile: cfg,
-		digestMap:  make(map[v1.Hash]v1.Layer),
+		base:     base,
+		manifest: m.DeepCopy(),
 	}
 
 	rcfg, err := image.RawConfigFile()
@@ -166,33 +101,139 @@ func configFile(base v1.Image, cfg *v1.ConfigFile) (v1.Image, error) {
 	}
 	image.manifest.Config.Digest = d
 	image.manifest.Config.Size = sz
+	image.configFile = cfg
 	return image, nil
 }
 
 // CreatedAt mutates the provided v1.Image to have the provided v1.Time
 func CreatedAt(base v1.Image, created v1.Time) (v1.Image, error) {
-	cf, err := base.ConfigFile()
-	if err != nil {
-		return nil, err
+	setCreatedAt := func(cf v1.ConfigFile) (*v1.ConfigFile, error) {
+		cf.Created = created
+		return &cf, nil
 	}
 
-	cfg := cf.DeepCopy()
-	cfg.Created = created
-
-	return configFile(base, cfg)
+	return &image{
+		base: base,
+		muts: []ConfigMutation{setCreatedAt},
+	}, nil
 }
 
 type image struct {
-	v1.Image
+	base v1.Image
+	adds []Addendum
+	muts []ConfigMutation
+
+	computed   bool
 	configFile *v1.ConfigFile
 	manifest   *v1.Manifest
 	diffIDMap  map[v1.Hash]v1.Layer
 	digestMap  map[v1.Hash]v1.Layer
 }
 
+var _ v1.Image = (*image)(nil)
+
+func (i *image) MediaType() (types.MediaType, error) { return i.base.MediaType() }
+
+func (i *image) compute() error {
+	// Don't re-compute if already computed.
+	if i.computed {
+		return nil
+	}
+	cf, err := i.base.ConfigFile()
+	if err != nil {
+		return err
+	}
+	configFile := cf.DeepCopy()
+	diffIDs := configFile.RootFS.DiffIDs
+	history := configFile.History
+
+	diffIDMap := make(map[v1.Hash]v1.Layer)
+	digestMap := make(map[v1.Hash]v1.Layer)
+
+	for _, add := range i.adds {
+		diffID, err := add.Layer.DiffID()
+		if err != nil {
+			return err
+		}
+		diffIDs = append(diffIDs, diffID)
+		history = append(history, add.History)
+		diffIDMap[diffID] = add.Layer
+	}
+
+	m, err := i.base.Manifest()
+	if err != nil {
+		return err
+	}
+	manifest := m.DeepCopy()
+	manifestLayers := manifest.Layers
+	for _, add := range i.adds {
+		d := v1.Descriptor{
+			MediaType: types.DockerLayer,
+		}
+
+		var err error
+		if d.Size, err = add.Layer.Size(); err != nil {
+			return err
+		}
+
+		if d.Digest, err = add.Layer.Digest(); err != nil {
+			return err
+		}
+
+		manifestLayers = append(manifestLayers, d)
+		digestMap[d.Digest] = add.Layer
+	}
+
+	configFile.RootFS.DiffIDs = diffIDs
+	configFile.History = history
+
+	manifest.Layers = manifestLayers
+
+	for _, mut := range i.muts {
+		configFile, err = mut(*configFile)
+		if err != nil {
+			return err
+		}
+	}
+
+	rcfg, err := json.Marshal(configFile)
+	if err != nil {
+		return err
+	}
+	d, sz, err := v1.SHA256(bytes.NewBuffer(rcfg))
+	if err != nil {
+		return err
+	}
+	manifest.Config.Digest = d
+	manifest.Config.Size = sz
+
+	i.configFile = configFile
+	i.manifest = manifest
+	i.diffIDMap = diffIDMap
+	i.digestMap = digestMap
+	i.computed = true
+	return nil
+}
+
 // Layers returns the ordered collection of filesystem layers that comprise this image.
 // The order of the list is oldest/base layer first, and most-recent/top layer last.
 func (i *image) Layers() ([]v1.Layer, error) {
+	if err := i.compute(); err == stream.ErrNotComputed {
+		// Image contains a streamable layer which has not yet been
+		// consumed. Just return the layers we have in case the caller
+		// is going to consume the layers.
+		layers, err := i.base.Layers()
+		if err != nil {
+			return nil, err
+		}
+		for _, add := range i.adds {
+			layers = append(layers, add.Layer)
+		}
+		return layers, nil
+	} else if err != nil {
+		return nil, err
+	}
+
 	diffIDs, err := partial.DiffIDs(i)
 	if err != nil {
 		return nil, err
@@ -210,36 +251,57 @@ func (i *image) Layers() ([]v1.Layer, error) {
 
 // BlobSet returns an unordered collection of all the blobs in the image.
 func (i *image) BlobSet() (map[v1.Hash]struct{}, error) {
+	if err := i.compute(); err != nil {
+		return nil, err
+	}
 	return partial.BlobSet(i)
 }
 
 // ConfigName returns the hash of the image's config file.
 func (i *image) ConfigName() (v1.Hash, error) {
+	if err := i.compute(); err != nil {
+		return v1.Hash{}, err
+	}
 	return partial.ConfigName(i)
 }
 
 // ConfigFile returns this image's config file.
 func (i *image) ConfigFile() (*v1.ConfigFile, error) {
+	if err := i.compute(); err != nil {
+		return nil, err
+	}
 	return i.configFile, nil
 }
 
 // RawConfigFile returns the serialized bytes of ConfigFile()
 func (i *image) RawConfigFile() ([]byte, error) {
+	if err := i.compute(); err != nil {
+		return nil, err
+	}
 	return json.Marshal(i.configFile)
 }
 
 // Digest returns the sha256 of this image's manifest.
 func (i *image) Digest() (v1.Hash, error) {
+	if err := i.compute(); err != nil {
+		return v1.Hash{}, err
+	}
 	return partial.Digest(i)
 }
 
 // Manifest returns this image's Manifest object.
 func (i *image) Manifest() (*v1.Manifest, error) {
+	if err := i.compute(); err != nil {
+		return nil, err
+	}
 	return i.manifest, nil
 }
 
 // RawManifest returns the serialized bytes of Manifest()
 func (i *image) RawManifest() ([]byte, error) {
+	if err := i.compute(); err != nil {
+		return nil, err
+	}
 	return json.Marshal(i.manifest)
 }
 
@@ -254,7 +316,7 @@ func (i *image) LayerByDigest(h v1.Hash) (v1.Layer, error) {
 	if layer, ok := i.digestMap[h]; ok {
 		return layer, nil
 	}
-	return i.Image.LayerByDigest(h)
+	return i.base.LayerByDigest(h)
 }
 
 // LayerByDiffID is an analog to LayerByDigest, looking up by "diff id"
@@ -263,7 +325,7 @@ func (i *image) LayerByDiffID(h v1.Hash) (v1.Layer, error) {
 	if layer, ok := i.diffIDMap[h]; ok {
 		return layer, nil
 	}
-	return i.Image.LayerByDiffID(h)
+	return i.base.LayerByDiffID(h)
 }
 
 func validate(adds []Addendum) error {
@@ -392,14 +454,13 @@ func Time(img v1.Image, t time.Time) (v1.Image, error) {
 
 	layers, err := img.Layers()
 	if err != nil {
-
 		return nil, fmt.Errorf("Error getting image layers: %v", err)
 	}
 
 	// Strip away all timestamps from layers
 	var newLayers []v1.Layer
 	for _, layer := range layers {
-		newLayer, err := layerTime(layer, t)
+		newLayer, err := LayerTime(layer, t)
 		if err != nil {
 			return nil, fmt.Errorf("Error setting layer times: %v", err)
 		}
@@ -411,79 +472,76 @@ func Time(img v1.Image, t time.Time) (v1.Image, error) {
 		return nil, fmt.Errorf("Error appending layers: %v", err)
 	}
 
-	ocf, err := img.ConfigFile()
-	if err != nil {
-		return nil, fmt.Errorf("Error getting original config file: %v", err)
+	setConfigTime := func(cf v1.ConfigFile) (*v1.ConfigFile, error) {
+		ocf, err := img.ConfigFile()
+		if err != nil {
+			return nil, fmt.Errorf("mutate.Time failed to read original image config: %v", err)
+		}
+
+		// Copy basic config over
+		cf.Config = ocf.Config
+		cf.ContainerConfig = ocf.ContainerConfig
+
+		// Strip away timestamps from the config file
+		cf.Created = v1.Time{Time: t}
+
+		for _, h := range cf.History {
+			h.Created = v1.Time{Time: t}
+		}
+
+		return &cf, nil
 	}
 
-	cf, err := newImage.ConfigFile()
-	if err != nil {
-		return nil, fmt.Errorf("Error setting config file: %v", err)
-	}
-
-	cfg := cf.DeepCopy()
-
-	// Copy basic config over
-	cfg.Config = ocf.Config
-	cfg.ContainerConfig = ocf.ContainerConfig
-
-	// Strip away timestamps from the config file
-	cfg.Created = v1.Time{Time: t}
-
-	for _, h := range cfg.History {
-		h.Created = v1.Time{Time: t}
-	}
-
-	return configFile(newImage, cfg)
+	return &image{
+		base: newImage,
+		muts: []ConfigMutation{setConfigTime},
+	}, nil
 }
 
-func layerTime(layer v1.Layer, t time.Time) (v1.Layer, error) {
-	layerReader, err := layer.Uncompressed()
-	if err != nil {
-		return nil, fmt.Errorf("Error getting layer: %v", err)
-	}
-	w := new(bytes.Buffer)
-	tarWriter := tar.NewWriter(w)
-	defer tarWriter.Close()
+func LayerTime(layer v1.Layer, t time.Time) (v1.Layer, error) {
+	pr, pw := io.Pipe()
 
-	tarReader := tar.NewReader(layerReader)
-	for {
-		header, err := tarReader.Next()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return nil, fmt.Errorf("Error reading layer: %v", err)
-		}
+	go func() {
+		defer pw.Close()
 
-		header.ModTime = t
-		if err := tarWriter.WriteHeader(header); err != nil {
-			return nil, fmt.Errorf("Error writing tar header: %v", err)
-		}
+		tarWriter := tar.NewWriter(pw)
+		defer tarWriter.Close()
 
-		if header.Typeflag == tar.TypeReg {
-			if _, err = io.Copy(tarWriter, tarReader); err != nil {
-				return nil, fmt.Errorf("Error writing layer file: %v", err)
+		if err := func() error {
+			lr, err := layer.Uncompressed()
+			if err != nil {
+				return fmt.Errorf("Error reading layer: %v", err)
 			}
+			defer lr.Close()
+			tarReader := tar.NewReader(lr)
+
+			for {
+				header, err := tarReader.Next()
+				if err == io.EOF {
+					break
+				}
+				if err != nil {
+					return fmt.Errorf("Error reading layer: %v", err)
+				}
+
+				header.ModTime = t
+				if err := tarWriter.WriteHeader(header); err != nil {
+					return fmt.Errorf("Error writing tar header: %v", err)
+				}
+
+				if header.Typeflag == tar.TypeReg {
+					if _, err = io.Copy(tarWriter, tarReader); err != nil {
+						return fmt.Errorf("Error writing layer file: %v", err)
+					}
+				}
+			}
+			return nil
+		}(); err != nil {
+			pr.CloseWithError(err)
 		}
-	}
+	}()
 
-	b := w.Bytes()
-	// gzip the contents, then create the layer
-	opener := func() (io.ReadCloser, error) {
-		g, err := v1util.GzipReadCloser(ioutil.NopCloser(bytes.NewReader(b)))
-		if err != nil {
-			return nil, fmt.Errorf("Error compressing layer: %v", err)
-		}
-
-		return g, nil
-	}
-	layer, err = tarball.LayerFromOpener(opener)
-	if err != nil {
-		return nil, fmt.Errorf("Error creating layer: %v", err)
-	}
-
-	return layer, nil
+	return stream.NewLayer(pr), nil
 }
 
 // Canonical is a helper function to combine Time and configFile
@@ -496,18 +554,17 @@ func Canonical(img v1.Image) (v1.Image, error) {
 		return nil, err
 	}
 
-	cf, err := img.ConfigFile()
-	if err != nil {
-		return nil, err
+	stripNondeterminism := func(cf v1.ConfigFile) (*v1.ConfigFile, error) {
+		cf.Container = ""
+		cf.Config.Hostname = ""
+		cf.ContainerConfig.Hostname = ""
+		cf.DockerVersion = ""
+
+		return &cf, nil
 	}
 
-	// Get rid of host-dependent random config
-	cfg := cf.DeepCopy()
-
-	cfg.Container = ""
-	cfg.Config.Hostname = ""
-	cfg.ContainerConfig.Hostname = ""
-	cfg.DockerVersion = ""
-
-	return configFile(img, cfg)
+	return &image{
+		base: img,
+		muts: []ConfigMutation{stripNondeterminism},
+	}, nil
 }
