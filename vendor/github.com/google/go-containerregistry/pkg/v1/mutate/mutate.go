@@ -26,7 +26,6 @@ import (
 	"time"
 
 	"github.com/google/go-containerregistry/pkg/v1"
-	"github.com/google/go-containerregistry/pkg/v1/empty"
 	"github.com/google/go-containerregistry/pkg/v1/partial"
 	"github.com/google/go-containerregistry/pkg/v1/stream"
 	"github.com/google/go-containerregistry/pkg/v1/types"
@@ -40,8 +39,6 @@ type Addendum struct {
 	Layer   v1.Layer
 	History v1.History
 }
-
-type ConfigMutation func(v1.ConfigFile) (*v1.ConfigFile, error)
 
 // AppendLayers applies layers to a base image
 func AppendLayers(base v1.Image, layers ...v1.Layer) (v1.Image, error) {
@@ -68,60 +65,9 @@ func Append(base v1.Image, adds ...Addendum) (v1.Image, error) {
 	}, nil
 }
 
-// Config mutates the provided v1.Image to have the provided v1.Config
-func Config(base v1.Image, cfg v1.Config) (v1.Image, error) {
-	setConfig := func(cf v1.ConfigFile) (*v1.ConfigFile, error) {
-		cf.Config = cfg
-		return &cf, nil
-	}
-	return &image{
-		base: base,
-		muts: []ConfigMutation{setConfig},
-	}, nil
-}
-
-func configFile(base v1.Image, cfg *v1.ConfigFile) (v1.Image, error) {
-	m, err := base.Manifest()
-	if err != nil {
-		return nil, err
-	}
-
-	image := &image{
-		base:     base,
-		manifest: m.DeepCopy(),
-	}
-
-	rcfg, err := image.RawConfigFile()
-	if err != nil {
-		return nil, err
-	}
-	d, sz, err := v1.SHA256(bytes.NewBuffer(rcfg))
-	if err != nil {
-		return nil, err
-	}
-	image.manifest.Config.Digest = d
-	image.manifest.Config.Size = sz
-	image.configFile = cfg
-	return image, nil
-}
-
-// CreatedAt mutates the provided v1.Image to have the provided v1.Time
-func CreatedAt(base v1.Image, created v1.Time) (v1.Image, error) {
-	setCreatedAt := func(cf v1.ConfigFile) (*v1.ConfigFile, error) {
-		cf.Created = created
-		return &cf, nil
-	}
-
-	return &image{
-		base: base,
-		muts: []ConfigMutation{setCreatedAt},
-	}, nil
-}
-
 type image struct {
 	base v1.Image
 	adds []Addendum
-	muts []ConfigMutation
 
 	computed   bool
 	configFile *v1.ConfigFile
@@ -188,13 +134,6 @@ func (i *image) compute() error {
 	configFile.History = history
 
 	manifest.Layers = manifestLayers
-
-	for _, mut := range i.muts {
-		configFile, err = mut(*configFile)
-		if err != nil {
-			return err
-		}
-	}
 
 	rcfg, err := json.Marshal(configFile)
 	if err != nil {
@@ -448,56 +387,6 @@ func inWhiteoutDir(fileMap map[string]bool, file string) bool {
 	return false
 }
 
-// Time sets all timestamps in an image to the given timestamp.
-func Time(img v1.Image, t time.Time) (v1.Image, error) {
-	newImage := empty.Image
-
-	layers, err := img.Layers()
-	if err != nil {
-		return nil, fmt.Errorf("Error getting image layers: %v", err)
-	}
-
-	// Strip away all timestamps from layers
-	var newLayers []v1.Layer
-	for _, layer := range layers {
-		newLayer, err := LayerTime(layer, t)
-		if err != nil {
-			return nil, fmt.Errorf("Error setting layer times: %v", err)
-		}
-		newLayers = append(newLayers, newLayer)
-	}
-
-	newImage, err = AppendLayers(newImage, newLayers...)
-	if err != nil {
-		return nil, fmt.Errorf("Error appending layers: %v", err)
-	}
-
-	setConfigTime := func(cf v1.ConfigFile) (*v1.ConfigFile, error) {
-		ocf, err := img.ConfigFile()
-		if err != nil {
-			return nil, fmt.Errorf("mutate.Time failed to read original image config: %v", err)
-		}
-
-		// Copy basic config over
-		cf.Config = ocf.Config
-		cf.ContainerConfig = ocf.ContainerConfig
-
-		// Strip away timestamps from the config file
-		cf.Created = v1.Time{Time: t}
-
-		for _, h := range cf.History {
-			h.Created = v1.Time{Time: t}
-		}
-
-		return &cf, nil
-	}
-
-	return &image{
-		base: newImage,
-		muts: []ConfigMutation{setConfigTime},
-	}, nil
-}
-
 func LayerTime(layer v1.Layer, t time.Time) (v1.Layer, error) {
 	pr, pw := io.Pipe()
 
@@ -542,29 +431,4 @@ func LayerTime(layer v1.Layer, t time.Time) (v1.Layer, error) {
 	}()
 
 	return stream.NewLayer(pr), nil
-}
-
-// Canonical is a helper function to combine Time and configFile
-// to remove any randomness during a docker build.
-func Canonical(img v1.Image) (v1.Image, error) {
-	// Set all timestamps to 0
-	created := time.Time{}
-	img, err := Time(img, created)
-	if err != nil {
-		return nil, err
-	}
-
-	stripNondeterminism := func(cf v1.ConfigFile) (*v1.ConfigFile, error) {
-		cf.Container = ""
-		cf.Config.Hostname = ""
-		cf.ContainerConfig.Hostname = ""
-		cf.DockerVersion = ""
-
-		return &cf, nil
-	}
-
-	return &image{
-		base: img,
-		muts: []ConfigMutation{stripNondeterminism},
-	}, nil
 }
