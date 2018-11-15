@@ -29,6 +29,7 @@ import (
 	"github.com/google/go-containerregistry/pkg/v1/partial"
 	"github.com/google/go-containerregistry/pkg/v1/remote/transport"
 	"github.com/google/go-containerregistry/pkg/v1/stream"
+	"github.com/google/go-containerregistry/pkg/v1/v1util"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -175,9 +176,8 @@ func (w *writer) initiateUpload(from, mount string) (location string, mounted bo
 // On failure, this will return an error.  On success, this will return the location
 // header indicating how to commit the streamed blob.
 func (w *writer) streamBlob(blob io.ReadCloser, streamLocation string) (commitLocation string, err error) {
-	defer blob.Close()
-
-	req, err := http.NewRequest(http.MethodPatch, streamLocation, blob)
+	nopped := v1util.NopReadCloser(blob)
+	req, err := http.NewRequest(http.MethodPatch, streamLocation, nopped)
 	if err != nil {
 		return "", err
 	}
