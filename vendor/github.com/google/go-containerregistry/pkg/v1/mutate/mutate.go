@@ -387,16 +387,14 @@ func inWhiteoutDir(fileMap map[string]bool, file string) bool {
 	return false
 }
 
-func LayerTime(layer v1.Layer, t time.Time) (v1.Layer, error) {
+func LayerTime(layer v1.Layer, t time.Time) v1.Layer {
 	pr, pw := io.Pipe()
 
 	go func() {
-		defer pw.Close()
-
 		tarWriter := tar.NewWriter(pw)
 		defer tarWriter.Close()
 
-		if err := func() error {
+		err := func() error {
 			lr, err := layer.Uncompressed()
 			if err != nil {
 				return fmt.Errorf("Error reading layer: %v", err)
@@ -425,10 +423,9 @@ func LayerTime(layer v1.Layer, t time.Time) (v1.Layer, error) {
 				}
 			}
 			return nil
-		}(); err != nil {
-			pr.CloseWithError(err)
-		}
+		}()
+		pw.CloseWithError(err)
 	}()
 
-	return stream.NewLayer(pr), nil
+	return stream.NewLayer(pr)
 }

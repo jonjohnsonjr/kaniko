@@ -69,7 +69,70 @@ func (l *Layer) Size() (int64, error) {
 }
 
 func (l *Layer) Uncompressed() (io.ReadCloser, error) {
-	return nil, errors.New("NYI: stream.Layer.Uncompressed is not implemented")
+	if l.consumed {
+		return nil, ErrConsumed
+	}
+
+	return newUncompressedReader(l)
+}
+
+type uncompressedReader struct {
+	closer io.Closer // original blob's Closer.
+
+	h     hash.Hash // collects hash of uncompressed stream
+	pr    io.Reader
+	count *countWriter
+
+	l *Layer // stream.Layer to update upon Close.
+}
+
+func newUncompressedReader(l *Layer) (*uncompressedReader, error) {
+	h := sha256.New()
+	count := &countWriter{}
+
+	// gzip.Writer writes to the output stream via pipe, a hasher to
+	// capture compressed digest, and a countWriter to capture compressed
+	// size.
+	pr, pw := io.Pipe()
+
+	ur := &uncompressedReader{
+		closer: l.blob,
+		pr:     pr,
+		h:      h,
+		count:  count,
+		l:      l,
+	}
+	go func() {
+		if _, err := io.Copy(io.MultiWriter(pw, h, count), l.blob); err != nil {
+			pw.CloseWithError(err)
+			return
+		}
+		// Now close the uncompressed reader, to calculate diffID/size.
+		// This will cause pr to return EOF which will cause readers of the
+		// Uncompressed stream to finish reading.
+		pw.CloseWithError(ur.Close())
+	}()
+
+	return ur, nil
+}
+
+func (ur *uncompressedReader) Read(b []byte) (int, error) { return ur.pr.Read(b) }
+
+func (ur *uncompressedReader) Close() error {
+	// Close the inner ReadCloser.
+	if err := ur.closer.Close(); err != nil {
+		return err
+	}
+
+	diffID, err := v1.NewHash("sha256:" + hex.EncodeToString(ur.h.Sum(nil)))
+	if err != nil {
+		return err
+	}
+	ur.l.diffID = &diffID
+
+	ur.l.size = ur.count.n
+	ur.l.consumed = true
+	return nil
 }
 
 func (l *Layer) Compressed() (io.ReadCloser, error) {

@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"time"
 
 	"github.com/GoogleContainerTools/kaniko/pkg/cache"
 	"github.com/GoogleContainerTools/kaniko/pkg/config"
@@ -114,7 +115,7 @@ func pushLayerToCache(opts *config.KanikoOptions, cacheKey string, tarPath strin
 	if err != nil {
 		return err
 	}
-	layer := stream.NewLayer(f)
+	layer := mutate.LayerTime(stream.NewLayer(f), time.Time{})
 
 	cache, err := cache.Destination(opts, cacheKey)
 	if err != nil {
